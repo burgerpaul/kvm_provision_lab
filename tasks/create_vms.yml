@@ -1,33 +1,25 @@
 ---
-- name: Configure the image
-  command: |
-    virt-customize -a {{ libvirt_pool_dir }}/{{ item.key }}.qcow2 \
-    --hostname {{ item.key }} \
-    --root-password password:{{ vm_root_pass }} \
-    --ssh-inject 'root:file:{{ ssh_key }}' \
-    --uninstall cloud-init --selinux-relabel
-  when: copy_results is changed
-
 - name: Define VMs
   community.libvirt.virt:
     command: define
     xml: "{{ lookup('template', '{{ item.value.vm_template }}.xml.j2') }}"
+  when: "item.key not in existing_vms.list_vms"
 
 - name: Create second disk images if needed
-  command: |-
+  ansible.builtin.command: |
     qemu-img create -q -f {{ item.value.file_type }} \
     {{ libvirt_pool_dir }}/{{ item.key }}-vdb.{{ item.value.file_type }} {{ item.value.second_hdd_size }}
-  become: yes
-  when: item.value.second_hdd|bool == true
+  become: true
+  when: item.value.second_hdd | bool == true
 
 - name: Attach second disk image to domain
-  command: |
+  ansible.builtin.command: |
     virsh -c qemu:///system attach-disk {{ item.key }} \
     --source "{{ libvirt_pool_dir }}/{{ item.key }}-vdb.{{ item.value.file_type }}" \
     --target vdb \
     --subdriver qcow2 \
     --persistent
-  become: yes
+  become: true
   when: item.value.second_hdd|bool == true
 
 - name: Ensure VMs are startet

@@ -5,7 +5,7 @@
   vars:
     __rolename_ff_params:
       files:
-        - "{{ ansible_facts['distribution'] }}_{{ 
+        - "{{ ansible_facts['distribution'] }}_{{
           ansible_facts['distribution_version'] }}.yml"
         - "{{ ansible_facts['os_family'] }}.yml"
       paths:
@@ -20,13 +20,40 @@
 
 - name: Copy base image
   ansible.builtin.copy:
-    dest: "{{ libvirt_pool_dir }}/{{ item.key }}.{{ item.value.file_type }}"
-    src: "{{ libvirt_pool_dir }}/{{ item.value.base_image_name }}.{{ item.value.file_type }}"
+    dest: "{{ libvirt_pool_dir }}/{{ disk.key }}.{{ disk.value.file_type }}"
+    src: "{{ libvirt_template_dir }}/{{ disk.value.base_image_name }}.{{ disk.value.file_type }}"
     force: false
     remote_src: true
-    mode: 0660
+    mode: "0660"
       #    group: libvirt-qemu
   register: copy_results
+  with_dict: "{{ guests }}"
+  loop_control:
+    loop_var: disk
+
+- name: Configure the image
+  ansible.builtin.command: |
+    virt-customize -a {{ libvirt_pool_dir }}/{{ item.key }}.qcow2 \
+    --uninstall cloud-init --selinux-relabel \
+    --firstboot-command 'dpk-reconfigure openssh-server' \
+  when: copy_results is changed
+  with_dict: "{{ guests }}"
+
+- name: Virt Sysprep the image
+  ansible.builtin.command: |
+    virt-sysprep --operations \
+    bash-history,logfiles,mail-spool,pacct-log,package-manager-cache,machine-id,ssh-hostkeys \
+    -a {{ libvirt_pool_dir }}/{{ disk.key }}.{{ disk.value.file_type }}
+  when: copy_results is changed
+  with_dict: "{{ guests }}"
+  loop_control:
+    loop_var: disk
+
+- name: Sparsify the image
+  ansible.builtin.command: |
+    virt-sparsify --in-place \
+    {{ libvirt_pool_dir }}/{{ item.key }}.{{ item.value.file_type }}
+  when: copy_results is changed
   with_dict: "{{ guests }}"
 
 - name: Create VMs if not exist

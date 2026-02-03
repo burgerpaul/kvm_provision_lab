@@ -1,5 +1,12 @@
 <domain type='kvm'>
   <name>{{ item.key }}</name>
+  {% if item.value.vm_title is defined %}
+  <title>{{ item.value.vm_title }}</title>
+  {% endif %}
+  <description>
+  Created on {{ lookup('pipe', 'date +%Y-%m-%d-%H:%M') }}.
+  {% if item.value.vm_description is defined %}{{ item.value.vm_description }}{% endif %}
+  </description>
   <metadata>
     <libosinfo:libosinfo xmlns:libosinfo="http://libosinfo.org/xmlns/libvirt/domain/1.0">
       <libosinfo:os id="http://redhat.com/rhel/9-unknown"/>
