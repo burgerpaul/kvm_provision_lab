@@ -4,6 +4,7 @@
     command: define
     xml: "{{ lookup('template', '{{ item.value.vm_template }}.xml.j2') }}"
   when: "item.key not in existing_vms.list_vms"
+  tags: createvm
 
 - name: Create second disk images if needed
   ansible.builtin.command: |
@@ -11,6 +12,7 @@
     {{ libvirt_pool_dir }}/{{ item.key }}-vdb.{{ item.value.file_type }} {{ item.value.second_hdd_size }}
   become: true
   when: item.value.second_hdd | bool == true
+  tags: createvm
 
 - name: Attach second disk image to domain
   ansible.builtin.command: |
@@ -21,6 +23,7 @@
     --persistent
   become: true
   when: item.value.second_hdd|bool == true
+  tags: createvm
 
 - name: Ensure VMs are startet
   community.libvirt.virt:
@@ -30,3 +33,4 @@
   until: "vm_start_results is success"
   retries: 15
   delay: 2
+  tags: createvm

@@ -1,8 +1,9 @@
 ---
 - name: Ensure requirements are in place
-  apt:
+  ansible.builtin.apt:
     name:
       - libguestfs-tools
       - python3-libvirt
     state: present
-  become: yes
+  become: true
+  tags: createvm

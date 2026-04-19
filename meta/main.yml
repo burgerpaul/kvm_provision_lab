@@ -33,3 +33,4 @@ galaxy_info:
 
   dependencies:
     - community.libvirt
+    - community.general

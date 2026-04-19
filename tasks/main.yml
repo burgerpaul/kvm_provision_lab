@@ -11,12 +11,14 @@
       paths:
         - "{{ role_path }}/tasks/setup"
       skip: true
+  tags: createvm
 
 - name: Get VMs list
   community.libvirt.virt:
     command: list_vms
   register: existing_vms
-  changed_when: no
+  changed_when: false
+  tags: createvm
 
 - name: Copy base image
   ansible.builtin.copy:
@@ -30,6 +32,7 @@
   with_dict: "{{ guests }}"
   loop_control:
     loop_var: disk
+  tags: createvm
 
 - name: Configure the image
   ansible.builtin.command: |
@@ -38,6 +41,7 @@
     --firstboot-command 'dpk-reconfigure openssh-server' \
   when: copy_results is changed
   with_dict: "{{ guests }}"
+  tags: createvm
 
 - name: Virt Sysprep the image
   ansible.builtin.command: |
@@ -48,6 +52,7 @@
   with_dict: "{{ guests }}"
   loop_control:
     loop_var: disk
+  tags: createvm
 
 - name: Sparsify the image
   ansible.builtin.command: |
@@ -55,8 +60,14 @@
     {{ libvirt_pool_dir }}/{{ item.key }}.{{ item.value.file_type }}
   when: copy_results is changed
   with_dict: "{{ guests }}"
+  tags: createvm
 
 - name: Create VMs if not exist
   ansible.builtin.include_tasks: create_vms.yml
   when: "item.key not in existing_vms.list_vms"
   with_dict: "{{ guests }}"
+  tags: createvm
+
+- name: Update DNS and DHCP for created guests
+  ansible.builtin.include_tasks: dnsupdate.yml
+  tags: [ createvm, dnsconfig ]
