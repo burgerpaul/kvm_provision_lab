@@ -1,0 +1,221 @@
+---
+# Tasks to update DNS and ISC DHCP for created VMs
+# - Discovers MAC address from the virtualized VM via libvirt
+# - Finds first available IP from configured network ranges
+# - Adds host block to ISC DHCP server config with discovered MAC and IP
+# - Updates DNS A records using `community.general.nsupdate`
+# 
+# Required variables (can be set in group_vars/host_vars):
+#   network_ip_ranges: dict mapping network names to IP ranges with start/end
+#     Example:
+#       network_ip_ranges:
+#         intern: { start: 192.168.122.100, end: 192.168.122.200 }
+#   dns_zone: DNS zone name (default: example.local)
+#   dns_server: DNS server address (default: 127.0.0.1)
+#   dhcp_config_path: ISC DHCP config file path (default: /etc/dhcp/dhcpd.conf)
+#   dhcp_server_host: hostname/IP of the DHCP server to delegate config changes to
+#
+# Per-guest options:
+#   dns: true          - Create DNS A record for the VM
+#   dns_name: custom   - Override DNS hostname (default: VM name)
+#   dhcp_host: true    - Add DHCP host entry (MAC/IP auto-discovered)
+
+- name: Get created VM's MAC address from libvirt
+  community.libvirt.virt:
+    command: get_xml
+    name: "{{ item.key }}"
+  register: vm_xml_result
+  loop: "{{ guests | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  when: item.value.dns is defined or item.value.dhcp_host is defined
+  tags: dnsconfig
+
+- name: Extract MAC address from VM XML definition
+  ansible.builtin.set_fact:
+    vm_mac_addresses: "{{ vm_mac_addresses | default({}) | combine({item.item.key: _mac}) }}"
+  vars:
+    _mac: "{{ item.get_xml | regex_search(\"mac address='([0-9a-fA-F:]+)'\", '\\1') | first }}"
+  loop: "{{ vm_xml_result.results }}"
+  loop_control:
+    label: "{{ item.item.key }}"
+  when: item.get_xml is defined and item.get_xml != ""
+  tags: dnsconfig
+
+- name: Debug discovered MAC addresses
+  ansible.builtin.debug:
+    msg: "Discovered MAC for {{ item.key }}: {{ vm_mac_addresses.get(item.key, 'none') }}"
+  loop: "{{ guests | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  when: item.value.dns is defined or item.value.dhcp_host is defined
+  tags: dnsconfig
+
+- name: Query DHCP leases file to find used IPs
+  ansible.builtin.slurp:
+    src: "{{ dhcp_leases_file | default('/var/lib/dhcp/dhcpd.leases') }}"
+  register: dhcp_leases_content
+  ignore_errors: true
+  tags: dnsconfig
+
+- name: Parse used IPs from DHCP leases
+  ansible.builtin.set_fact:
+    used_ips: "{{ used_ips | default([]) + [(item | regex_search('[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}')) ] }}"
+  loop: "{{ (dhcp_leases_content.content | b64decode).split('\\n') | select('search', 'fixed-address') | list }}"
+  loop_control:
+    label: "DHCP lease"
+  when: dhcp_leases_content is not skipped and dhcp_leases_content.content is defined
+  tags: dnsconfig
+
+- name: Find and assign first available IP for each VM (collision-safe across all VMs)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    declare -A assigned
+    result="{"
+    first=1
+
+    {% for vm_name, vm in guests.items() %}
+    {% if (vm.dns is defined or vm.dhcp_host is defined) and
+          network_ip_ranges is defined and
+          vm.vm_net in network_ip_ranges %}
+    {%   set net = network_ip_ranges[vm.vm_net] %}
+    {%   set ip_prefix = net.start.split('.')[:3] | join('.') %}
+    {%   set start_octet = net.start.split('.')[-1] | int %}
+    {%   set end_octet   = net.end.split('.')[-1]   | int %}
+    found_ip=""
+    for octet in $(seq {{ start_octet }} {{ end_octet }}); do
+      candidate="{{ ip_prefix }}.$octet"
+      if [[ -n "${assigned[$candidate]+x}" ]]; then
+        continue
+      fi
+      ptr=$(dig @{{ dns_server | default('127.0.0.1') }} -x "$candidate" +short 2>/dev/null)
+      if [ -z "$ptr" ]; then
+        found_ip="$candidate"
+        assigned["$candidate"]=1
+        break
+      fi
+    done
+    [ -z "$found_ip" ] && found_ip="{{ net.start }}"
+    [ $first -eq 0 ] && result="$result,"
+    result="$result\"{{ vm_name }}\":\"$found_ip\""
+    first=0
+    {% endif %}
+    {% endfor %}
+
+    result="$result}"
+    echo "$result"
+  args:
+    executable: /bin/bash
+  register: ip_lookup_result
+  changed_when: false
+  when: network_ip_ranges is defined
+  tags: dnsconfig
+
+- name: Assign IPs to VMs (from collision-safe DNS probe)
+  ansible.builtin.set_fact:
+    vm_assigned_ips: "{{ ip_lookup_result.stdout | from_json }}"
+  when: ip_lookup_result.stdout is defined and ip_lookup_result.stdout != ""
+  tags: dnsconfig
+
+- name: Show assigned IPs for debugging
+  ansible.builtin.debug:
+    msg: "Assigned IP for {{ item.key }}: {{ vm_assigned_ips.get(item.key, 'none') }}"
+  loop: "{{ guests | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  when: item.value.dns is defined or item.value.dhcp_host is defined
+  tags: dnsconfig
+
+- name: Debug, check which variables are defined for each VM
+  ansible.builtin.debug:
+    msg: "item.value.dhcp_host={{ item.value.dhcp_host | default('undefined') }}, item.value.dns={{ item.value.dns | default('undefined') }}"
+  loop: "{{ guests | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  tags: dnsconfig
+
+- name: Add DHCP host entries for created VMs with discovered MAC and IP
+  ansible.builtin.blockinfile:
+    path: "{{ dhcp_config_path | default('/etc/dhcp/dhcpd.conf') }}"
+    insertafter: EOF
+    marker: "# {mark} ANSIBLE MANAGED HOST {{ item.key }}"
+    block: |
+      host {{ item.key }} {
+        hardware ethernet {{ vm_mac_addresses.get(item.key) }};
+        fixed-address {{ vm_assigned_ips.get(item.key, item.value.ip | default('')) }};
+        option host-name "{{ item.key }}";
+      }
+  loop: "{{ guests | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  when:
+    - vm_mac_addresses.get(item.key) is defined
+    - vm_assigned_ips.get(item.key) is defined or item.value.ip is defined
+    - item.value.dhcp_host is defined
+  delegate_to: "{{ dhcp_server_host }}"
+  become: true
+  register: dhcp_updates
+  tags: dnsconfig
+
+- name: Restart DHCP service if configuration changed
+  ansible.builtin.service:
+    name: "{{ dhcp_service_name | default('isc-dhcp-server') }}"
+    state: restarted
+  delegate_to: "{{ dhcp_server_host }}"
+  become: true
+  when: dhcp_updates is defined and dhcp_updates.results is defined and (dhcp_updates.results | selectattr('changed') | list | length) > 0
+  tags: dnsconfig
+
+- name: Debug, dns_tsig_key_name
+  ansible.builtin.debug:
+    msg: "dns_tsig_key_name={{ dns_tsig_key_name | default('undefined') }} dns_tsig_key_secret={{ dns_tsig_key_secret | default('undefined') }}"
+  tags: dnsconfig
+
+- name: Update DNS A records using nsupdate with discovered IP
+  community.general.nsupdate:
+    server: "{{ dns_server | default('127.0.0.1') }}"
+    zone: "{{ dns_zone | default('example.local') }}"
+    record: "{{ (item.value.dns_name | default(item.key)) + '.' + (dns_zone | default('example.local')) + '.' }}"
+    type: A
+    value: "{{ vm_assigned_ips.get(item.key, item.value.ip | default('')) }}"
+    ttl: "{{ dns_ttl | default(3600) }}"
+    key_name: "{{ dns_tsig_key_name | default(omit) }}"
+    key_secret: "{{ dns_tsig_key_secret | default(omit) }}"
+    key_algorithm: "{{ dns_tsig_key_algorithm | default('hmac-sha512') }}"
+    state: present
+  loop: "{{ guests | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  when:
+    - (vm_assigned_ips.get(item.key) is defined or item.value.ip is defined)
+    - item.value.dns is defined
+  delegate_to: "localhost"
+  register: dns_updates
+  tags: dnsconfig
+
+- name: Add PTR records in DNS for created VMs
+  community.general.nsupdate:
+    server: "{{ dns_server | default('127.0.0.1') }}"
+    zone: "{{ _reverse_zone }}"
+    record: "{{ _ip_last_octet }}.{{ _reverse_zone }}."
+    type: PTR
+    value: "{{ (item.value.dns_name | default(item.key)) + '.' + (dns_zone | default('example.local')) + '.' }}"
+    ttl: "{{ dns_ttl | default(3600) }}"
+    key_name: "{{ dns_tsig_key_name | default(omit) }}"
+    key_secret: "{{ dns_tsig_key_secret | default(omit) }}"
+    key_algorithm: "{{ dns_tsig_key_algorithm | default('hmac-sha512') }}"
+    state: present
+  vars:
+    _ip: "{{ vm_assigned_ips.get(item.key, item.value.ip | default('')) }}"
+    _ip_parts: "{{ _ip.split('.') }}"
+    _ip_last_octet: "{{ _ip_parts[3] }}"
+    _reverse_zone: "{{ _ip_parts[2] }}.{{ _ip_parts[1] }}.{{ _ip_parts[0] }}.in-addr.arpa"
+  loop: "{{ guests | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  when:
+    - vm_assigned_ips is defined
+    - vm_assigned_ips.get(item.key) is defined or item.value.ip is defined
+    - item.value.dns is defined
+  delegate_to: "localhost"
+  tags: dnsconfig
